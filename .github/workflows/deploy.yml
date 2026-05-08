@@ -105,94 +105,16 @@ jobs:
             ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -i /tmp/deploy_key ubuntu@$SERVER_IP echo ok && break || sleep 10
           done
 
-      - name: Write Ansible playbook
+      - name: Run Ansible playbook
+        env:
+          REPO_URL: https://${{ secrets.GH_PAT }}@github.com/${{ secrets.GH_REPO }}.git
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GH_REPO: ${{ secrets.GH_REPO }}
+          GH_BRANCH: ${{ secrets.GH_BRANCH }}
         run: |
-          mkdir -p ${{ env.ANSIBLE_DIR }}
-          cat > ${{ env.ANSIBLE_DIR }}/playbook.yml << 'PLAYBOOK'
-          ---
-          - name: Deploy Node.js application
-            hosts: all
-            become: yes
-            vars:
-              app_dir: /opt/app
-              app_user: ubuntu
-              node_version: "20"
-
-            tasks:
-              - name: Update apt cache
-                apt:
-                  update_cache: yes
-                  cache_valid_time: 3600
-
-              - name: Install required system packages
-                apt:
-                  name:
-                    - curl
-                    - git
-                    - nginx
-                    - ufw
-                  state: present
-
-              - name: Check if NodeSource setup script was already run
-                stat:
-                  path: /etc/apt/sources.list.d/nodesource.list
-                register: nodesource_list
-
-              - name: Add NodeSource repository
-                shell: curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-                when: not nodesource_list.stat.exists
-
-              - name: Install Node.js
-                apt:
-                  name: nodejs
-                  state: present
-                  update_cache: yes
-
-              - name: Install PM2 globally
-                npm:
-                  name: pm2
-                  global: yes
-                  state: present
-
-              - name: Create app directory
-                file:
-                  path: "{{ app_dir }}"
-                  state: directory
-                  owner: "{{ app_user }}"
-                  group: "{{ app_user }}"
-                  mode: "0755"
-
-              - name: Check if repo already cloned
-                stat:
-                  path: "{{ app_dir }}/.git"
-                register: git_dir
-
-              - name: Clone application repository
-                become_user: "{{ app_user }}"
-                git:
-                  repo: "https://{{ lookup('env', 'GH_PAT') }}@github.com/{{ lookup('env', 'GH_REPO') }}.git"
-                  dest: "{{ app_dir }}"
-                  version: "{{ lookup('env', 'GH_BRANCH') | default('main', true) }}"
-                  force: yes
-                when: not git_dir.stat.exists
-
-              - name: Pull latest application code
-                become_user: "{{ app_user }}"
-                git:
-                  repo: "https://{{ lookup('env', 'GH_PAT') }}@github.com/{{ lookup('env', 'GH_REPO') }}.git"
-                  dest: "{{ app_dir }}"
-                  version: "{{ lookup('env', 'GH_BRANCH') | default('main', true) }}"
-                  force: yes
-                when: git_dir.stat.exists
-
-              - name: Install npm dependencies
-                become_user: "{{ app_user }}"
-                npm:
-                  path: "{{ app_dir }}"
-                  state: present
-
-              - name: Check if build script exists in package.json
-                become_user: "{{ app_user }}"
-                shell: node -e "const p=require('./package.json'); process.exit(p.scripts && p.scripts.build ? 0 : 1);"
-                args:
-PLAYBOOK
+          ansible-playbook \
+            -i "$SERVER_IP," \
+            --private-key /tmp/deploy_key \
+            -u ubuntu \
+            -e "ansible_ssh_common_args='-o StrictHostKeyChecking=no'" \
+            ${{ env.ANSIBLE_DIR }}/playbook.yml
