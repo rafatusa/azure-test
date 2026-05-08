@@ -8,8 +8,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  TF_DIR: infra/terraform
-  ANSIBLE_DIR: infra/ansible
+  TF_DIR: terraform
+  ANSIBLE_DIR: ansible
 
 jobs:
   provision:
@@ -76,7 +76,7 @@ jobs:
           ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
           ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
         run: |
-          SERVER_IP=$(terraform output -raw public_ip_address)
+          SERVER_IP=$(terraform output -raw public_ip)
           echo "server_ip=$SERVER_IP" >> "$GITHUB_OUTPUT"
 
   configure:
