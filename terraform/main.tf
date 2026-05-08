@@ -47,6 +47,12 @@ variable "public_key" {
   type        = string
 }
 
+variable "project_name" {
+  description = "Project name"
+  type        = string
+  default     = "azure-test"
+}
+
 variable "app_name" {
   description = "Application name"
   type        = string
@@ -197,19 +203,4 @@ output "public_ip" {
 output "vm_id" {
   description = "ID of the virtual machine"
   value       = azurerm_linux_virtual_machine.main.id
-}
-
-output "admin_username" {
-  description = "Admin username for SSH access"
-  value       = var.admin_username
-}
-
-output "ssh_connection" {
-  description = "SSH connection string"
-  value       = "ssh -i <private_key> ${var.admin_username}@${azurerm_public_ip.main.ip_address}"
-}
-
-output "app_url" {
-  description = "Application URL"
-  value       = "http://${azurerm_public_ip.main.ip_address}"
 }
