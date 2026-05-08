@@ -31,9 +31,6 @@ jobs:
         uses: azure/login@v1
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
-          client-id: ${{ secrets.ARM_CLIENT_ID }}
-          tenant-id: ${{ secrets.ARM_TENANT_ID }}
-          subscription-id: ${{ secrets.ARM_SUBSCRIPTION_ID }}
 
       - name: Write SSH public key file
         run: echo "${{ secrets.SSH_PUBLIC_KEY }}" > /tmp/deploy_key.pub
@@ -198,8 +195,4 @@ jobs:
                 become_user: "{{ app_user }}"
                 shell: node -e "const p=require('./package.json'); process.exit(p.scripts && p.scripts.build ? 0 : 1);"
                 args:
-                  chdir: "{{ app_dir }}"
-                register: has_build_script
-                ignore_errors: yes
-          ... (203 more lines truncated)
-          PLAYBOOK
+PLAYBOOK
