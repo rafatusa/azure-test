@@ -1,0 +1,403 @@
+name: Deploy Node to Azure VM
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  TF_DIR: infra/terraform
+  ANSIBLE_DIR: infra/ansible
+
+jobs:
+  provision:
+    name: Provision Azure VM via Terraform
+    runs-on: ubuntu-latest
+    outputs:
+      server_ip: ${{ steps.get_ip.outputs.server_ip }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.7.5
+          terraform_wrapper: false
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Write SSH public key file
+        run: echo "${{ secrets.SSH_PUBLIC_KEY }}" > /tmp/deploy_key.pub
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform init -reconfigure \
+            -backend-config="resource_group_name=${{ secrets.TF_STATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ secrets.TF_STATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ secrets.TF_STATE_CONTAINER }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
+
+      - name: Terraform Plan
+        working-directory: ${{ env.TF_DIR }}
+        env:
+          ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+          ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+        run: |
+          terraform plan \
+            -var="public_key=${{ secrets.SSH_PUBLIC_KEY }}" \
+            -var="project_name=${{ secrets.PROJECT_NAME }}" \
+            -var="location=eastus" \
+            -out=tfplan
+
+      - name: Terraform Apply
+        working-directory: ${{ env.TF_DIR }}
+        env:
+          ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+          ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+        run: terraform apply -auto-approve tfplan
+
+      - name: Get server IP
+        id: get_ip
+        working-directory: ${{ env.TF_DIR }}
+        env:
+          ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+          ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+        run: |
+          SERVER_IP=$(terraform output -raw public_ip_address)
+          echo "server_ip=$SERVER_IP" >> "$GITHUB_OUTPUT"
+
+  configure:
+    name: Configure VM via Ansible
+    runs-on: ubuntu-latest
+    needs: provision
+    env:
+      SERVER_IP: ${{ needs.provision.outputs.server_ip }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Ansible
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y ansible
+
+      - name: Write SSH private key
+        run: |
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > /tmp/deploy_key
+          chmod 600 /tmp/deploy_key
+
+      - name: Wait for SSH
+        run: |
+          for i in $(seq 1 30); do
+            ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -i /tmp/deploy_key ubuntu@$SERVER_IP echo ok && break || sleep 10
+          done
+
+      - name: Write Ansible playbook
+        run: |
+          mkdir -p ${{ env.ANSIBLE_DIR }}
+          cat > ${{ env.ANSIBLE_DIR }}/playbook.yml << 'PLAYBOOK'
+          ---
+          - name: Deploy Node.js application
+            hosts: all
+            become: yes
+            vars:
+              app_dir: /opt/app
+              app_user: ubuntu
+              node_version: "20"
+
+            tasks:
+              - name: Update apt cache
+                apt:
+                  update_cache: yes
+                  cache_valid_time: 3600
+
+              - name: Install required system packages
+                apt:
+                  name:
+                    - curl
+                    - git
+                    - nginx
+                    - ufw
+                  state: present
+
+              - name: Check if NodeSource setup script was already run
+                stat:
+                  path: /etc/apt/sources.list.d/nodesource.list
+                register: nodesource_list
+
+              - name: Add NodeSource repository
+                shell: curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+                when: not nodesource_list.stat.exists
+
+              - name: Install Node.js
+                apt:
+                  name: nodejs
+                  state: present
+                  update_cache: yes
+
+              - name: Install PM2 globally
+                npm:
+                  name: pm2
+                  global: yes
+                  state: present
+
+              - name: Create app directory
+                file:
+                  path: "{{ app_dir }}"
+                  state: directory
+                  owner: "{{ app_user }}"
+                  group: "{{ app_user }}"
+                  mode: "0755"
+
+              - name: Check if repo already cloned
+                stat:
+                  path: "{{ app_dir }}/.git"
+                register: git_dir
+
+              - name: Clone application repository
+                become_user: "{{ app_user }}"
+                git:
+                  repo: "https://{{ lookup('env', 'GH_PAT') }}@github.com/{{ lookup('env', 'GH_REPO') }}.git"
+                  dest: "{{ app_dir }}"
+                  version: "{{ lookup('env', 'GH_BRANCH') | default('main', true) }}"
+                  force: yes
+                when: not git_dir.stat.exists
+
+              - name: Pull latest application code
+                become_user: "{{ app_user }}"
+                git:
+                  repo: "https://{{ lookup('env', 'GH_PAT') }}@github.com/{{ lookup('env', 'GH_REPO') }}.git"
+                  dest: "{{ app_dir }}"
+                  version: "{{ lookup('env', 'GH_BRANCH') | default('main', true) }}"
+                  force: yes
+                when: git_dir.stat.exists
+
+              - name: Install npm dependencies
+                become_user: "{{ app_user }}"
+                npm:
+                  path: "{{ app_dir }}"
+                  state: present
+
+              - name: Check if build script exists in package.json
+                become_user: "{{ app_user }}"
+                shell: node -e "const p=require('./package.json'); process.exit(p.scripts && p.scripts.build ? 0 : 1);"
+                args:
+                  chdir: "{{ app_dir }}"
+                register: has_build_script
+                ignore_errors: yes
+
+              - name: Run build step if build script exists
+                become_user: "{{ app_user }}"
+                shell: npm run build
+                args:
+                  chdir: "{{ app_dir }}"
+                when: has_build_script.rc == 0
+
+              - name: Delete existing PM2 app if running
+                become_user: "{{ app_user }}"
+                shell: pm2 delete app 2>/dev/null || true
+
+              - name: Start application with PM2
+                become_user: "{{ app_user }}"
+                shell: pm2 start npm --name app -- start --update-env
+                args:
+                  chdir: "{{ app_dir }}"
+
+              - name: Save PM2 process list
+                become_user: "{{ app_user }}"
+                shell: pm2 save
+
+              - name: Configure PM2 startup on boot
+                shell: pm2 startup systemd -u ubuntu --hp /home/ubuntu
+                register: pm2_startup_cmd
+
+              - name: Enable PM2 startup service
+                shell: systemctl enable pm2-ubuntu || true
+
+              - name: Wait for application to start on port 3000
+                wait_for:
+                  host: 127.0.0.1
+                  port: 3000
+                  delay: 5
+                  timeout: 60
+                ignore_errors: yes
+                register: app_wait
+
+              - name: Dump PM2 logs if app failed to start
+                become_user: "{{ app_user }}"
+                shell: pm2 logs app --lines 50 --nostream
+                when: app_wait.failed is defined and app_wait.failed
+
+              - name: Fail if application did not start
+                fail:
+                  msg: "Application did not start on port 3000. Check PM2 logs above."
+                when: app_wait.failed is defined and app_wait.failed
+
+              - name: Configure Nginx
+                copy:
+                  dest: /etc/nginx/sites-available/app
+                  content: |
+                    server {
+                        listen 80;
+                        server_name _;
+
+                        location / {
+                            proxy_pass http://127.0.0.1:3000;
+                            proxy_http_version 1.1;
+                            proxy_set_header Upgrade $http_upgrade;
+                            proxy_set_header Connection 'upgrade';
+                            proxy_set_header Host $host;
+                            proxy_set_header X-Real-IP $remote_addr;
+                            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                            proxy_set_header X-Forwarded-Proto $scheme;
+                            proxy_cache_bypass $http_upgrade;
+                            proxy_read_timeout 120s;
+                        }
+                    }
+
+              - name: Enable Nginx site
+                file:
+                  src: /etc/nginx/sites-available/app
+                  dest: /etc/nginx/sites-enabled/app
+                  state: link
+
+              - name: Remove default Nginx site
+                file:
+                  path: /etc/nginx/sites-enabled/default
+                  state: absent
+
+              - name: Test Nginx configuration
+                shell: nginx -t
+
+              - name: Restart and enable Nginx
+                systemd:
+                  name: nginx
+                  state: restarted
+                  enabled: yes
+
+              - name: Configure UFW firewall - allow SSH
+                ufw:
+                  rule: allow
+                  port: "22"
+                  proto: tcp
+
+              - name: Configure UFW firewall - allow HTTP
+                ufw:
+                  rule: allow
+                  port: "80"
+                  proto: tcp
+
+              - name: Configure UFW firewall - allow HTTPS
+                ufw:
+                  rule: allow
+                  port: "443"
+                  proto: tcp
+
+              - name: Enable UFW
+                ufw:
+                  state: enabled
+                  policy: deny
+          PLAYBOOK
+
+      - name: Run Ansible playbook
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GH_REPO: ${{ github.repository }}
+          GH_BRANCH: ${{ github.ref_name }}
+        run: |
+          ansible-playbook \
+            -i "$SERVER_IP," \
+            --private-key /tmp/deploy_key \
+            -u ubuntu \
+            ${{ env.ANSIBLE_DIR }}/playbook.yml
+
+  verify:
+    name: Verify Deployment
+    runs-on: ubuntu-latest
+    needs: [provision, configure]
+    env:
+      SERVER_IP: ${{ needs.provision.outputs.server_ip }}
+    steps:
+      - name: Write SSH private key
+        run: |
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > /tmp/deploy_key
+          chmod 600 /tmp/deploy_key
+
+      - name: Verify health endpoint via Nginx (port 80)
+        run: |
+          echo "Checking health endpoint at http://$SERVER_IP/health"
+          for i in $(seq 1 12); do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 http://$SERVER_IP/health || echo "000")
+            echo "Attempt $i: HTTP $HTTP_CODE"
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "Health check passed!"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "Health check failed after all attempts"
+          exit 1
+
+      - name: Verify application status via SSH
+        run: |
+          ssh -o StrictHostKeyChecking=no -i /tmp/deploy_key ubuntu@$SERVER_IP \
+            "pm2 list && pm2 show app"
+
+      - name: Verify Nginx status via SSH
+        run: |
+          ssh -o StrictHostKeyChecking=no -i /tmp/deploy_key ubuntu@$SERVER_IP \
+            "sudo systemctl status nginx --no-pager"
+
+  notify:
+    name: Notify Deployment Result
+    runs-on: ubuntu-latest
+    needs: [provision, verify]
+    if: always()
+    env:
+      SERVER_IP: ${{ needs.provision.outputs.server_ip }}
+    steps:
+      - name: Deployment success summary
+        if: needs.verify.result == 'success'
+        run: |
+          echo "=========================================="
+          echo "  DEPLOYMENT SUCCEEDED"
+          echo "=========================================="
+          echo "  Project   : ${{ secrets.PROJECT_NAME }}"
+          echo "  App       : node"
+          echo "  Target    : azure-vm"
+          echo "  Server IP : $SERVER_IP"
+          echo "  URL       : http://$SERVER_IP"
+          echo "  Health    : http://$SERVER_IP/health"
+          echo "  Commit    : ${{ github.sha }}"
+          echo "  Actor     : ${{ github.actor }}"
+          echo "=========================================="
+
+      - name: Deployment failure summary
+        if: needs.verify.result != 'success'
+        run: |
+          echo "=========================================="
+          echo "  DEPLOYMENT FAILED"
+          echo "=========================================="
+          echo "  Project   : ${{ secrets.PROJECT_NAME }}"
+          echo "  App       : node"
+          echo "  Target    : azure-vm"
+          echo "  Server IP : $SERVER_IP"
+          echo "  Commit    : ${{ github.sha }}"
+          echo "  Actor     : ${{ github.actor }}"
+          echo "  Check GitHub Actions logs for details."
+          echo "=========================================="
+          exit 1

@@ -1,0 +1,210 @@
+---
+- name: Deploy node on Azure VM
+  hosts: all
+  become: yes
+  vars:
+    app_name: node
+    app_dir: /opt/app
+    app_port: 3000
+    app_user: ubuntu
+    node_version: "20"
+
+  tasks:
+
+    - name: "Update apt cache"
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: "Install required system packages"
+      apt:
+        name:
+          - curl
+          - git
+          - nginx
+          - build-essential
+        state: present
+
+    - name: "Download NodeSource setup script for Node.js 20"
+      shell: |
+        curl -fsSL https://deb.nodesource.com/setup_{{ node_version }}.x | bash -
+      args:
+        executable: /bin/bash
+
+    - name: "Install Node.js"
+      apt:
+        name: nodejs
+        state: present
+
+    - name: "Install PM2 globally"
+      npm:
+        name: pm2
+        global: yes
+        state: present
+
+    - name: "Create app directory"
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0755"
+
+    - name: "Clone or update application repository"
+      git:
+        repo: "{{ lookup('env', 'REPO_URL') | default('https://github.com/placeholder/node-app.git', true) }}"
+        dest: "{{ app_dir }}"
+        version: main
+        force: yes
+      become: yes
+      become_user: "{{ app_user }}"
+      ignore_errors: yes
+
+    - name: "Copy application files from local"
+      synchronize:
+        src: "../"
+        dest: "{{ app_dir }}/"
+        rsync_opts:
+          - "--exclude=.git"
+          - "--exclude=node_modules"
+          - "--exclude=ansible"
+          - "--exclude=terraform"
+          - "--exclude=.env"
+      delegate_to: localhost
+      become: no
+      ignore_errors: yes
+
+    - name: "Set app directory ownership"
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        recurse: yes
+
+    - name: "Install npm dependencies"
+      npm:
+        path: "{{ app_dir }}"
+        state: present
+      become: yes
+      become_user: "{{ app_user }}"
+
+    - name: "Check if package.json has build script"
+      shell: |
+        node -e "const p=require('{{ app_dir }}/package.json'); process.exit(p.scripts && p.scripts.build ? 0 : 1);"
+      register: has_build_script
+      ignore_errors: yes
+      become: yes
+      become_user: "{{ app_user }}"
+
+    - name: "Run npm build if build script exists"
+      shell: |
+        cd {{ app_dir }} && npm run build
+      when: has_build_script.rc == 0
+      become: yes
+      become_user: "{{ app_user }}"
+
+    - name: "Stop existing PM2 app if running"
+      shell: |
+        pm2 delete app 2>/dev/null || true
+      become: yes
+      become_user: "{{ app_user }}"
+
+    - name: "Start application with PM2"
+      shell: |
+        cd {{ app_dir }} && pm2 start npm --name app -- start --update-env
+      become: yes
+      become_user: "{{ app_user }}"
+
+    - name: "Save PM2 process list"
+      shell: |
+        pm2 save
+      become: yes
+      become_user: "{{ app_user }}"
+
+    - name: "Configure PM2 to start on boot"
+      shell: |
+        pm2 startup systemd -u {{ app_user }} --hp /home/{{ app_user }}
+      register: pm2_startup_output
+
+    - name: "Enable PM2 systemd service"
+      shell: |
+        systemctl enable pm2-{{ app_user }} 2>/dev/null || true
+      ignore_errors: yes
+
+    - name: "Wait for application to be ready on port 3000"
+      wait_for:
+        host: 127.0.0.1
+        port: "{{ app_port }}"
+        delay: 5
+        timeout: 60
+      ignore_errors: yes
+      register: app_wait
+
+    - name: "Dump PM2 logs if app did not start"
+      shell: |
+        pm2 logs app --lines 50 --nostream
+      when: app_wait.failed is defined and app_wait.failed
+      become: yes
+      become_user: "{{ app_user }}"
+      ignore_errors: yes
+
+    - name: "Fail if application is not listening on port 3000"
+      fail:
+        msg: "Application failed to start on port {{ app_port }}. Check PM2 logs above."
+      when: app_wait.failed is defined and app_wait.failed
+
+    - name: "Remove default Nginx site"
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+    - name: "Configure Nginx reverse proxy"
+      copy:
+        dest: /etc/nginx/sites-available/app
+        content: |
+          server {
+              listen 80;
+              server_name _;
+
+              location / {
+                  proxy_pass http://127.0.0.1:{{ app_port }};
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection 'upgrade';
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+                  proxy_cache_bypass $http_upgrade;
+              }
+          }
+
+    - name: "Enable Nginx app site"
+      file:
+        src: /etc/nginx/sites-available/app
+        dest: /etc/nginx/sites-enabled/app
+        state: link
+
+    - name: "Test Nginx configuration"
+      command: nginx -t
+
+    - name: "Restart and enable Nginx"
+      systemd:
+        name: nginx
+        state: restarted
+        enabled: yes
+        daemon_reload: yes
+
+    - name: "Verify health endpoint"
+      uri:
+        url: "http://localhost:{{ app_port }}/health"
+        method: GET
+        status_code: 200
+        timeout: 10
+      register: health_check
+      ignore_errors: yes
+
+    - name: "Health check result"
+      debug:
+        msg: "Health check status: {{ health_check.status | default('unreachable') }}"
